@@ -1,15 +1,30 @@
-// main.cpp
-#include <Arduino.h>
+// #include <Arduino.h>
+// #include "TaskHandle.h"
+
+// void setup() {
+//   Serial.begin(9600);
+//   ModbusTask_setup();
+// }
+
+// void loop() {
+// }
+
+
+#include<Arduino.h>
 #include "RS485.h"          // Thư viện RS485 của bạn (class Modbus_RS485)
 
-#define MODBUS_SLAVE_ID   1        // Địa chỉ slave của module SHTC3-485
-#define SHTC3_REG_START   0x0000   // Địa chỉ thanh ghi bắt đầu (Temp)
-#define SHTC3_REG_COUNT   2        // Đọc 2 regs: Temp, Humi
-#define MODBUS_BAUD       9600      
+#define MODBUS_SHT3C_SLAVE_ID   2        // Địa chỉ slave của module SHTC3-485
+#define MODBUS_SHT3C_REG_START   0x0000   // Địa chỉ thanh ghi bắt đầu (Temp)
+#define MODBUS_SHT3C_REG_COUNT   2        // Đọc 2 regs: Temp, Humi
 
 #define SCALE_DIVISOR     10.0
 
-Modbus_RS485 modbus;  // Đối tượng từ thư viện của bạn
+#define MODBUS_LIGHT_SENSOR_ID   1        // Địa chỉ slave của module LightSensor-485
+#define MODBUS_LIGHT_SENSOR_REG_START   0x0003   // Địa chỉ thanh ghi bắt đầu (Light Intensity)
+#define MODBUS_LIGHT_SENSOR_REG_COUNT   1        // Đọc 2 regs: Light Intensity
+#define MODBUS_BAUD       4800
+
+Modbus_RS485 modbus;
 
 // In mảng bytes ở dạng hex cho debug
 static void printHex(const uint8_t* buf, size_t n) {
@@ -19,76 +34,83 @@ static void printHex(const uint8_t* buf, size_t n) {
   Serial.println();
 }
 
-// Đọc N holding registers, trả kết quả vào out[] (big-endian -> uint16)
-bool readHoldingRegs(uint8_t slaveId, uint16_t startAddr, uint16_t quantity, uint16_t* out) {
-  // Payload cho FC=03: [StartHi][StartLo][QtyHi][QtyLo]
-  uint8_t reqData[4];
-  reqData[0] = (startAddr >> 8) & 0xFF;
-  reqData[1] = (startAddr >> 0) & 0xFF;
-  reqData[2] = (quantity  >> 8) & 0xFF;
-  reqData[3] = (quantity  >> 0) & 0xFF;
+bool readHoldingRegs(uint8_t slaveID, uint16_t startArr, uint16_t quantity, uint16_t* out){
+    uint8_t reqData[4];
+    reqData[0] = (startArr >> 8) & 0xFF;
+    reqData[1] = (startArr >> 0) & 0XFF;
+    reqData[2] = (quantity >> 8) & 0xFF;
+    reqData[3] = (quantity >> 0) & 0xFF;
 
-  // Phản hồi FC=03: [ID][FC][ByteCount][Data...][CRC_L][CRC_H]
-  const uint16_t expectedLen = 1 + 1 + 1 + (quantity * 2) + 2; // = 5 + 2N
-  uint8_t rxBuf[64];
-  if (expectedLen > sizeof(rxBuf)) {
-    Serial.println("[ERR] expectedLen quá lớn cho rxBuf");
-    return false;
-  }
+    const uint16_t expectedLen = 1 + 1 + 1 + (quantity * 2) + 2;
+    uint8_t rxBuf[64];
+    if(expectedLen > sizeof(rxBuf)){
+        Serial.println("[ERR] expectedLen quá lớn cho rxBuf");
+        return false;
+    }
+    ErrorCode ec = modbus.RS485_masterTransmit(
+        slaveID,
+        0x03,
+        reqData, 4,
+        rxBuf, expectedLen
+    );
+    if(ec != MODBUS_OK){
+        Serial.printf("[ERR] RS485_masterTransmit thất bại: %d\n", (int)ec);
+        return false;
+    }
 
-  ErrorCode ec = modbus.RS485_masterTransmit(
-    slaveId,        // slave id
-    0x03,           // Function code: Read Holding Registers
-    reqData, 4,     // payload 4 byte
-    rxBuf, expectedLen
-  );
+    if(rxBuf[0] != slaveID || rxBuf[1] != 3){
+        Serial.println("[ERR] Phản hồi không hợp lệ (ID/FC sai)");
+        printHex(rxBuf, expectedLen);
+        return false;
+    }
 
-  if (ec != MODBUS_OK) {
-    Serial.printf("[ERR] RS485_masterTransmit thất bại: %d\n", (int)ec);
-    return false;
-  }
+    if(rxBuf[2] != quantity * 2){
+        Serial.println("[ERR] Phản hồi không hợp lệ (Byte count sai)");
+        printHex(rxBuf, expectedLen);
+        return false;
+    }
 
-  // Kiểm tra khung trả về cơ bản
-  if (rxBuf[0] != slaveId) {
-    Serial.printf("[ERR] Sai SlaveID: expect %u got %u\n", slaveId, rxBuf[0]);
-    return false;
-  }
-  if (rxBuf[1] != 0x03) {
-    Serial.printf("[ERR] Sai FunctionCode: expect 0x03 got 0x%02X\n", rxBuf[1]);
-    return false;
-  }
-  uint8_t byteCount = rxBuf[2];
-  if (byteCount != quantity * 2) {
-    Serial.printf("[ERR] Sai ByteCount: expect %u got %u\n", quantity * 2, byteCount);
-    Serial.print("Raw frame: "); printHex(rxBuf, expectedLen);
-    return false;
-  }
-
-  // Ghép 2 byte big-endian -> uint16
-  for (uint16_t i = 0; i < quantity; i++) {
+    if(!modbus.checkCrc(rxBuf, expectedLen)){
+        Serial.println("[ERR] CRC phản hồi không hợp lệ");
+        printHex(rxBuf, expectedLen);
+        return false;
+    }
+    if(slaveID == MODBUS_LIGHT_SENSOR_ID){
+    for(int i = 0, j = 3; i < quantity; i++, j += 2){
+        out[i] = (rxBuf[j] << 8) | rxBuf[j + 1];
+    }   
+    } else if(slaveID == MODBUS_SHT3C_SLAVE_ID){
+    for (uint16_t i = 0; i < quantity; i++) {
     uint8_t hi = rxBuf[3 + i * 2];
     uint8_t lo = rxBuf[3 + i * 2 + 1];
     out[i] = (uint16_t)hi << 8 | lo;
-  }
-
-  return true;
+    }
+    }
+    return true;
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(4800);
   delay(200);
 
   Serial.println("===== SHTC3 RS485 Modbus test (FC=03) =====");
-  // Khởi tạo thư viện RS485 của bạn (bên trong sẽ set EN_PIN, SoftwareSerial v.v.)
+
   modbus.begin(MODBUS_BAUD);
-  Serial.println("RS485 begin OK");
+  Serial.println("Modbus RS485 Light Sensor started.");
 }
 
-void loop() {
-  uint16_t regs[SHTC3_REG_COUNT] = {0};
 
-  if (readHoldingRegs(MODBUS_SLAVE_ID, SHTC3_REG_START, SHTC3_REG_COUNT, regs)) {
-    // Giải mã giá trị (tùy module: *10 hoặc *100)
+void loop() {
+  uint16_t modbus_regs[MODBUS_LIGHT_SENSOR_REG_COUNT] = {0};
+
+  if(readHoldingRegs(MODBUS_LIGHT_SENSOR_ID, MODBUS_LIGHT_SENSOR_REG_START, MODBUS_LIGHT_SENSOR_REG_COUNT, modbus_regs)){
+      Serial.printf("Light Intensity: %u lux\n", modbus_regs[0]);
+  } else {
+      Serial.println("Failed to read Light Sensor");
+  }
+
+  uint16_t regs[MODBUS_SHT3C_REG_COUNT] = {0};
+  if (readHoldingRegs(MODBUS_SHT3C_SLAVE_ID, MODBUS_SHT3C_REG_START, MODBUS_SHT3C_REG_COUNT, regs)) {
     float temperature = regs[0] / SCALE_DIVISOR;
     float humidity    = regs[1] / SCALE_DIVISOR;
 
@@ -98,5 +120,5 @@ void loop() {
     Serial.println("[WARN] Đọc Modbus thất bại");
   }
 
-  delay(2000);
+    delay(2000);
 }
